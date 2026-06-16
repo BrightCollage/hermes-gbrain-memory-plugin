@@ -223,7 +223,9 @@ def _mcp_tool_to_schema(mcp_tool: dict) -> dict:
     name = mcp_tool.get("name", "")
     desc = mcp_tool.get("description", "")
     input_schema = mcp_tool.get("inputSchema", mcp_tool.get("input_schema", {}))
-    return {"name": name, "description": desc, "parameters": input_schema}
+    # Prefix with gbrain_ so tools are discoverable as gbrain_* and don't
+    # collide with core or MCP tools of the same bare name.
+    return {"name": f"gbrain_{name}", "description": desc, "parameters": input_schema}
 
 
 class GBrainMemoryProvider(MemoryProvider):
@@ -304,7 +306,9 @@ class GBrainMemoryProvider(MemoryProvider):
         if not self._mcp:
             return json.dumps({"error": "GBrain not initialized"})
         try:
-            result = self._mcp.call(tool_name, args)
+            # Strip gbrain_ prefix — MCP server expects bare tool names
+            mcp_name = tool_name[7:] if tool_name.startswith("gbrain_") else tool_name
+            result = self._mcp.call(mcp_name, args)
             content_list = result.get("content", [])
             texts = [c["text"] for c in content_list if c.get("type") == "text"]
             return "\n".join(texts) if texts else json.dumps(result)
@@ -315,13 +319,12 @@ class GBrainMemoryProvider(MemoryProvider):
             return json.dumps({"error": f"{type(e).__name__}: {e}"})
 
     def system_prompt_block(self) -> str:
+        tools_desc = ", ".join(sorted(s["name"] for s in self._tool_cache[:6]))
         return (
             "## GBrain Persistent Memory\n"
             "You have persistent memory via GBrain. The gbrain_* tools let you "
-            "search, save, and reason across your knowledge base. For most recall "
-            "use gbrain_search. For recent activity use gbrain_salience. "
-            "For entity facts use gbrain_recall. Save important information "
-            "with gbrain_put."
+            "search, save, and reason across your knowledge base. Available tools: "
+            f"{tools_desc}, and more."
         )
 
 

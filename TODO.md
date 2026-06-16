@@ -10,23 +10,16 @@ The plugin is installed at `~/.hermes/plugins/gbrain/` with `memory.provider: gb
 
 ### 1. gbrain_* tools not showing up in Hermes sessions
 
-**Status:** UNRESOLVED — this is the main blocker.
+**Status:** FIXED
 
-When starting a new Hermes session, the agent reports no `gbrain_*` tools in its available tool list. The plugin is registered and enabled (`hermes plugins list` shows it), but tools are not being surfaced.
+**Root cause:** Two issues:
+1. **No `gbrain_` prefix** — dynamic MCP tool discovery passed through bare server tool names (`get_page`, `put_page`) without the `gbrain_` prefix. Fixed by adding `gbrain_` prefix in `_mcp_tool_to_schema()` and stripping it in `handle_tool_call()` before calling the MCP server.
+2. **Empty routing table** — `add_provider()` calls `get_tool_schemas()` before `initialize()`, so the routing table (`_tool_to_provider`) was empty. Fixed by adding a re-index step at the end of `MemoryManager.initialize_all()` in `memory_manager.py`.
 
-**Hypothesis:** The `register()` function calls `ctx.register_memory_provider(GBrainMemoryProvider())`, but maybe the MemoryManager isn't checking the `memory` toolset for the provider's tools, or the plugin's `get_tool_schemas()` isn't being called during prompt assembly.
-
-**Investigation needed:**
-- Check if `agent.memory_manager.MemoryManager` is actually activating the `gbrain` provider
-- Check if the `memory` toolset is enabled for the CLI platform (check `platform_toolsets.cli` in config.yaml — should include `memory`)
-- Trace why the MCP-replaced gbrain plugin tools aren't registering as tool schemas
-- Compare with the old working plugin at `~/gbrain-memory.backup` — it worked and showed 6 tools
-- Add debug logging to `initialize()`, `get_tool_schemas()`, and `handle_tool_call()` to trace the issue
-
-**Files to check:**
-- `agent/memory_manager.py` — how providers are activated and tools surfaced
-- `agent/prompt_builder.py` — how memory provider tools are injected into the system prompt
-- `toolsets.py` — how the `memory` toolset is defined
+**Changes:**
+- `__init__.py`: Added `gbrain_` prefix in `_mcp_tool_to_schema()`, strip prefix in `handle_tool_call()`
+- `agent/memory_manager.py`: Re-index tool names after `initialize_all()` completes
+- `__init__.py`: Updated `system_prompt_block()` to dynamically list available tools
 
 ### 2. Plugin `kind: memory` not recognized
 
