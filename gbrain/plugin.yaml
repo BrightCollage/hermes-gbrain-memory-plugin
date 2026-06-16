@@ -1,0 +1,11 @@
+name: gbrain
+version: 1.0.0
+description: "GBrain — persistent knowledge brain. Dynamic MCP wrapper that discovers all tools from the server."
+requires_env:
+  - MCP_GBRAIN_API_KEY
+optional_env:
+  - MCP_GBRAIN_URL
+  - GBRAIN_MCP_URL
+  - GBRAIN_API_TOKEN
+  - GBRAIN_MCP_TIMEOUT
+hooks: []
