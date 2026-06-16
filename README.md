@@ -17,9 +17,12 @@ Hermes agent
 ## Directory Structure
 
 ```
-~/.hermes/plugins/gbrain/
+~/.hermes/plugins/memory/gbrain/
 ├── plugin.yaml        # Metadata
-└── __init__.py        # MemoryProvider + MCP client + tool discovery
+├── __init__.py        # MemoryProvider + MCP client + tool discovery
+├── README.md          # This file
+├── DECISIONS.md       # Architecture decisions
+└── TODO.md            # Outstanding work
 ```
 
 ## Installation
