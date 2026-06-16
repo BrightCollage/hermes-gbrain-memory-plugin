@@ -1,10 +1,11 @@
-"""GBrain memory provider plugin — dynamic MCP server wrapper.
+"""GBrain memory provider plugin — hardcoded tool schemas.
 
-Connects to GBrain via MCP-over-HTTP (StreamableHTTP) and dynamically
-discovers all tools from the server via tools/list at init time.
-Exposes them through the MemoryProvider interface so the GBrain toolset
-is gated by the `memory` toolset instead of loading 83 tools in every
-session via mcp_servers.
+Connects to GBrain via MCP-over-HTTP (StreamableHTTP) and exposes
+83 hardcoded tool schemas through the MemoryProvider interface.
+No dynamic discovery — schemas are generated from the live server
+and stored in _schemas.py. Regenerate with:
+
+    python3 -c "from _schemas import *; ..."
 
 Config source (priority):
   1. Env vars: MCP_GBRAIN_URL, MCP_GBRAIN_API_KEY
@@ -26,6 +27,8 @@ import httpx
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 
+from ._schemas import HARDCODED_SCHEMAS, HARDCODED_SCHEMA_DICTS
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_URL = "https://gbrain.plainrandom.com/mcp"
@@ -37,7 +40,7 @@ class _McpError(RuntimeError):
 
 
 class _McpClient:
-    """Thread-safe MCP-over-HTTP client with auto-reconnect and tool discovery."""
+    """Thread-safe MCP-over-HTTP client. Connects on-demand, no tool discovery."""
 
     def __init__(self, url: str, api_token: str, timeout: float = _DEFAULT_TIMEOUT):
         self._base_url = url.rstrip("/")
@@ -47,13 +50,6 @@ class _McpClient:
         self._lock = threading.RLock()
         self._closed = False
         self._req_id = 0
-        self._tools: list[dict] | None = None
-
-    @property
-    def tools(self) -> list[dict]:
-        if self._tools is None:
-            self._ensure_session()
-        return self._tools or []
 
     def call(self, tool_name: str, arguments: dict) -> dict:
         if self._closed:
@@ -75,7 +71,6 @@ class _McpClient:
             logger.debug("MCP call failed, reconnecting: %s", exc)
             with self._lock:
                 self._session_id = None
-                self._tools = None
                 self._ensure_session()
                 body["id"] = self._next_id()
                 headers = self._auth_headers()
@@ -92,22 +87,10 @@ class _McpClient:
             raise _McpError(msg)
         return r
 
-    def health(self) -> bool:
-        try:
-            base = self._base_url.rstrip("/mcp").rstrip("/")
-            headers = {"Accept": "application/json"}
-            if self._api_token:
-                headers["Authorization"] = f"Bearer {self._api_token}"
-            resp = httpx.get(f"{base}/health", headers=headers, timeout=5.0)
-            return resp.status_code < 500
-        except Exception:
-            return False
-
     def close(self):
         with self._lock:
             self._closed = True
             self._session_id = None
-            self._tools = None
 
     def _auth_headers(self) -> dict:
         h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -123,13 +106,6 @@ class _McpClient:
 
     @staticmethod
     def _parse_sse(text: str) -> dict:
-        """Parse StreamableHTTP SSE response into a JSON-RPC dict.
-
-        Handles both single-event and multi-event SSE payloads. For
-        multi-event streams (e.g. streaming progress + final result),
-        returns the LAST valid JSON-RPC message (typically the final
-        result). Ignores non-JSON data lines and event metadata.
-        """
         last_result = None
         for line in text.splitlines():
             stripped = line.strip()
@@ -140,14 +116,13 @@ class _McpClient:
                     continue
         if last_result is not None:
             return last_result
-        # Fallback: try raw JSON
         return json.loads(text)
 
     def _ensure_session(self):
-        if self._session_id is not None and self._tools is not None:
+        if self._session_id is not None:
             return
         with self._lock:
-            if self._session_id is not None and self._tools is not None:
+            if self._session_id is not None:
                 return
             resp = httpx.post(
                 self._base_url,
@@ -177,20 +152,6 @@ class _McpClient:
                 )
             except Exception:
                 pass
-            try:
-                tools_resp = httpx.post(
-                    self._base_url,
-                    json={"jsonrpc": "2.0", "id": self._next_id(), "method": "tools/list", "params": {}},
-                    headers=self._auth_headers(),
-                    timeout=self._timeout,
-                )
-                tools_resp.raise_for_status()
-                tools_result = self._parse_sse(tools_resp.text)
-                self._tools = tools_result.get("result", {}).get("tools", [])
-                logger.info("Discovered %d GBrain MCP tools", len(self._tools or []))
-            except Exception as exc:
-                logger.warning("Failed to discover GBrain tools: %s", exc)
-                self._tools = []
 
 
 def _load_config() -> dict:
@@ -219,21 +180,11 @@ def _load_config() -> dict:
     return config
 
 
-def _mcp_tool_to_schema(mcp_tool: dict) -> dict:
-    name = mcp_tool.get("name", "")
-    desc = mcp_tool.get("description", "")
-    input_schema = mcp_tool.get("inputSchema", mcp_tool.get("input_schema", {}))
-    # Prefix with gbrain_ so tools are discoverable as gbrain_* and don't
-    # collide with core or MCP tools of the same bare name.
-    return {"name": f"gbrain_{name}", "description": desc, "parameters": input_schema}
-
-
 class GBrainMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._config: dict = {}
         self._mcp: _McpClient | None = None
-        self._tool_cache: list[dict] = []
 
     @property
     def name(self) -> str:
@@ -286,13 +237,7 @@ class GBrainMemoryProvider(MemoryProvider):
             logger.warning("GBrain not configured: missing api_token")
             return
         self._mcp = _McpClient(url, token, timeout)
-        try:
-            tools = self._mcp.tools
-            self._tool_cache = [_mcp_tool_to_schema(t) for t in tools]
-            logger.info("GBrain loaded %d tools from server", len(self._tool_cache))
-        except Exception as exc:
-            logger.warning("GBrain tool discovery failed: %s", exc)
-            self._tool_cache = []
+        logger.info("GBrain initialized — %d hardcoded tool schemas", len(HARDCODED_SCHEMA_DICTS))
 
     def shutdown(self) -> None:
         if self._mcp:
@@ -300,14 +245,17 @@ class GBrainMemoryProvider(MemoryProvider):
             self._mcp = None
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return list(self._tool_cache)
+        """Return hardcoded tool schemas — no dynamic discovery needed."""
+        return list(HARDCODED_SCHEMA_DICTS)
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         if not self._mcp:
             return json.dumps({"error": "GBrain not initialized"})
         try:
-            # Strip gbrain_ prefix — MCP server expects bare tool names
-            mcp_name = tool_name[7:] if tool_name.startswith("gbrain_") else tool_name
+            schema = HARDCODED_SCHEMAS.get(tool_name)
+            if not schema:
+                return json.dumps({"error": f"Unknown gbrain tool: {tool_name}"})
+            mcp_name = schema["mcp_name"]
             result = self._mcp.call(mcp_name, args)
             content_list = result.get("content", [])
             texts = [c["text"] for c in content_list if c.get("type") == "text"]
@@ -319,12 +267,12 @@ class GBrainMemoryProvider(MemoryProvider):
             return json.dumps({"error": f"{type(e).__name__}: {e}"})
 
     def system_prompt_block(self) -> str:
-        tools_desc = ", ".join(sorted(s["name"] for s in self._tool_cache[:6]))
+        names = [s["name"] for s in HARDCODED_SCHEMA_DICTS[:8]]
         return (
             "## GBrain Persistent Memory\n"
             "You have persistent memory via GBrain. The gbrain_* tools let you "
             "search, save, and reason across your knowledge base. Available tools: "
-            f"{tools_desc}, and more."
+            f"{', '.join(names)}, and more."
         )
 
 

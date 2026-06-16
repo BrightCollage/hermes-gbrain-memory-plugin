@@ -2,7 +2,7 @@
 
 ## Context
 
-This is a Hermes Agent memory provider plugin that wraps the GBrain MCP server. It lives at `~/.hermes/plugins/gbrain/` and connects to `https://gbrain.plainrandom.com/mcp` via MCP-over-HTTP (StreamableHTTP). It dynamically discovers all tools from the server via `tools/list` at init time.
+This is a Hermes Agent memory provider plugin that wraps the GBrain MCP server. It lives at `~/.hermes/plugins/gbrain/` (symlink to `~/.hermes/plugins/memory/gbrain/`) and connects to `https://gbrain.plainrandom.com/mcp` via MCP-over-HTTP (StreamableHTTP). Tool schemas are **hardcoded** — 83 `gbrain_*` tools generated from the live server, no dynamic discovery needed.
 
 The plugin is installed at `~/.hermes/plugins/gbrain/` with `memory.provider: gbrain` set in config.yaml. The old MCP server entry (`mcp_servers.gbrain`) has been removed. The old git-installed plugin at `plugins/gbrain-memory/` has been moved to `~/gbrain-memory.backup`.
 
@@ -12,14 +12,13 @@ The plugin is installed at `~/.hermes/plugins/gbrain/` with `memory.provider: gb
 
 **Status:** FIXED
 
-**Root cause:** Two issues:
-1. **No `gbrain_` prefix** — dynamic MCP tool discovery passed through bare server tool names (`get_page`, `put_page`) without the `gbrain_` prefix. Fixed by adding `gbrain_` prefix in `_mcp_tool_to_schema()` and stripping it in `handle_tool_call()` before calling the MCP server.
-2. **Empty routing table** — `add_provider()` calls `get_tool_schemas()` before `initialize()`, so the routing table (`_tool_to_provider`) was empty. Fixed by adding a re-index step at the end of `MemoryManager.initialize_all()` in `memory_manager.py`.
+**Root cause:** `add_provider()` calls `get_tool_schemas()` before `initialize()`. With dynamic discovery, `get_tool_schemas()` returned an empty list and the routing table was never populated. The fix: switch to **hardcoded schemas** so `get_tool_schemas()` returns all 83 tools immediately, no `initialize()` needed.
 
 **Changes:**
-- `__init__.py`: Added `gbrain_` prefix in `_mcp_tool_to_schema()`, strip prefix in `handle_tool_call()`
-- `agent/memory_manager.py`: Re-index tool names after `initialize_all()` completes
-- `__init__.py`: Updated `system_prompt_block()` to dynamically list available tools
+- `_schemas.py`: New file — 83 hardcoded tool schemas generated from the live server
+- `__init__.py`: `get_tool_schemas()` returns `HARDCODED_SCHEMA_DICTS` (always available), `handle_tool_call()` looks up `mcp_name` for the MCP call
+- `_McpClient` (`__init__.py`): Removed `tools` property and `tools/list` — no dynamic discovery needed
+- `memory_manager.py`: **No changes needed** — the original Hermes core is untouched
 
 ### 2. Plugin `kind: memory` not recognized
 
