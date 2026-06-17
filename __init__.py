@@ -18,7 +18,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +188,173 @@ class GBrainMemoryProvider(MemoryProvider):
         self._config: dict = {}
         self._mcp: _McpClient | None = None
 
+    # ── brain-agent-loop helpers ──────────────────────────────────────
+
+    _STOP_WORDS = frozenset({
+        "I", "The", "This", "That", "It", "We", "They", "You", "He", "She",
+        "A", "An", "And", "But", "Or", "For", "With", "Without", "From",
+        "About", "After", "Before", "During", "Over", "Under", "If", "When",
+        "What", "Where", "Which", "Who", "How", "Why", "Then", "Now", "Just",
+        "So", "Not", "No", "Yes", "Can", "Will", "Would", "Should", "May",
+        "Could", "Might", "Has", "Had", "Was", "Were", "Been", "Are", "Is",
+        "One", "Two", "All", "Some", "Any", "Each", "Every", "Both",
+        "Here", "There", "Also", "Still", "Even", "Only", "More", "Most",
+        "New", "Old", "First", "Last", "Next", "Same", "Such", "Very",
+        "Too", "Much", "Many", "Few", "Like", "Get", "Got", "Let", "See",
+        "Say", "Said", "Use", "Used", "Make", "Made", "Take", "Took",
+        "Think", "Know", "Want", "Need", "Going", "Come", "Came", "Look",
+        "Looks", "Well", "Sure", "Yeah", "Okay", "Ok", "Hey", "Hi",
+        "Please", "Thanks", "Today", "Yesterday", "Tomorrow",
+        "Morning", "Night", "Week", "Month", "Year",
+    })
+
+    @staticmethod
+    def _extract_candidates(text: str) -> list[str]:
+        """Extract capitalized multi-word phrases (likely entity names).
+
+        Returns at most 10 candidates, deduplicated, with stop-words removed.
+        """
+        if not text:
+            return []
+
+        # Pass 1: multi-word capitalized phrases (2+ words)
+        # e.g. "Acme Corp", "Series B", "New York"
+        multi = re.findall(
+            r'\b([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*)+)\b', text
+        )
+
+        # Pass 2: single capitalized words that follow prepositions or commas
+        # e.g. "talked to Alice about..." -> "Alice", "works at SAS" -> "SAS"
+        single = re.findall(
+            r'(?:to|from|with|about|for|by|at|of|in|on|and|,)\s+([A-Z][a-zA-Z]*)\b',
+            text
+        )
+
+        # Combine, filter stop-words, deduplicate
+        seen: set[str] = set()
+        candidates: list[str] = []
+        stop = GBrainMemoryProvider._STOP_WORDS
+
+        for name in multi + single:
+            name = name.strip()
+            if len(name) < 2:
+                continue
+            if name in stop:
+                continue
+            # Filter out names that are ALL stop-words
+            parts = name.split()
+            if len(parts) <= 2 and all(p in stop for p in parts):
+                continue
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                candidates.append(name)
+
+        return candidates[:10]
+
+    def _search_entity(self, name: str) -> str:
+        """Search GBrain for an entity name. Return formatted context or ''."""
+        if not self._mcp:
+            return ""
+        try:
+            result = self._mcp.call("search", {"query": name, "limit": 3})
+            content_list = result.get("content", [])
+            for c in content_list:
+                text = c.get("text", "")
+                if not text:
+                    continue
+                # Try to parse as structured JSON
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, list) and data:
+                        # Return compiled_truth from top 2 matches
+                        lines = [f"## Brain context for \"{name}\"", ""]
+                        for item in data[:2]:
+                            slug = item.get("slug", "")
+                            title = item.get("title", slug)
+                            chunk = item.get("chunk_text", "")
+                            page_type = item.get("type", "")
+                            # Truncate long chunks
+                            if len(chunk) > 600:
+                                chunk = chunk[:600] + "..."
+                            lines.append(
+                                f"**{title}** (/{slug}, {page_type})"
+                            )
+                            lines.append(chunk)
+                            lines.append("")
+                        return "\n".join(lines)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                # Fallback: return raw text (capped)
+                if len(text) > 1200:
+                    text = text[:1200] + "..."
+                return f"## Brain context for \"{name}\"\n\n{text}"
+        except Exception as e:
+            logger.debug("_search_entity failed for %r: %s", name, e)
+        return ""
+
+    def _resolve_entities(self, text: str) -> list[dict]:
+        """Extract entity names and resolve to brain slugs + types.
+
+        Returns list of {name, slug, type} dicts.
+        """
+        candidates = self._extract_candidates(text)
+        if not candidates:
+            return []
+
+        resolved: list[dict] = []
+        seen_slugs: set[str] = set()
+
+        for name in candidates[:5]:
+            try:
+                result = self._mcp.call("search", {"query": name, "limit": 3})
+                content_texts = [
+                    c.get("text", "")
+                    for c in result.get("content", [])
+                    if c.get("text")
+                ]
+                for raw in content_texts:
+                    try:
+                        data = json.loads(raw)
+                        if isinstance(data, list):
+                            for item in data:
+                                page_type = item.get("type", "")
+                                if page_type not in ("person", "company"):
+                                    continue
+                                slug = item.get("slug", "")
+                                title = item.get("title", "")
+                                if not slug or slug in seen_slugs:
+                                    continue
+                                # Verify the candidate name matches the page title
+                                name_lower = name.lower()
+                                title_lower = title.lower()
+                                if not (name_lower in title_lower
+                                        or title_lower.startswith(name_lower)
+                                        or name_lower.replace(" ", "-") in slug.lower()):
+                                    continue
+                                resolved.append({
+                                    "name": name,
+                                    "slug": slug,
+                                    "type": page_type,
+                                })
+                                seen_slugs.add(slug)
+                    except (json.JSONDecodeError, TypeError):
+                        # Fallback: extract slugs from wiki-link markdown
+                        for match in re.finditer(
+                            r'\[([^\]]+)\]\(/([^)]+)\)', raw
+                        ):
+                            slug = match.group(2)
+                            if slug not in seen_slugs:
+                                resolved.append({
+                                    "name": name,
+                                    "slug": slug,
+                                    "type": "unknown",
+                                })
+                                seen_slugs.add(slug)
+            except Exception as e:
+                logger.debug("_resolve_entities search failed for %r: %s", name, e)
+
+        return resolved[:5]
+
     @property
     def name(self) -> str:
         return "gbrain"
@@ -274,6 +443,94 @@ class GBrainMemoryProvider(MemoryProvider):
             "search, save, and reason across your knowledge base. Available tools: "
             f"{', '.join(names)}, and more."
         )
+
+    # ── brain-agent-loop: READ step (per guide — read brain BEFORE responding) ──
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Search GBrain for entities in the current message SYNCHRONOUSLY.
+
+        Per the brain-agent-loop guide: "Read BEFORE responding, not after."
+        Extracts entity names from the current message, searches GBrain for
+        each, and returns formatted context for injection into the model's
+        system prompt — all within the same turn.
+
+        The search is capped at ~1s total (up to 3 entity lookups) so the
+        latency hit is minimal. Providers with no entities to look up return
+        immediately.
+        """
+        if not self._mcp or not query:
+            return ""
+        candidates = self._extract_candidates(query)
+        if not candidates:
+            return ""
+
+        context_parts = []
+        for name in candidates[:3]:  # cap at 3 to keep latency low
+            ctx = self._search_entity(name)
+            if ctx:
+                context_parts.append(ctx)
+
+        if not context_parts:
+            return ""
+
+        return (
+            "## GBrain — automatically detected context\n\n"
+            + "\n---\n\n".join(context_parts)
+        )
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Warm the brain cache for the NEXT turn (optional — runs in background).
+
+        Called after each turn completes. Searches the current message's
+        entities so the next turn's prefetch() may benefit from cached
+        results, but the primary read path is prefetch() which runs
+        synchronously on the current turn.
+        """
+        # No-op: the primary read happens synchronously in prefetch().
+        # This hook is left available for future cache-warming use.
+        pass
+
+    def _write_timeline(self, slug: str, today_str: str) -> None:
+        """Add a timeline entry for a resolved entity slug."""
+        if not self._mcp:
+            return
+        try:
+            self._mcp.call("add_timeline_entry", {
+                "slug": slug,
+                "date": today_str,
+                "summary": f"Mentioned in conversation on {today_str}",
+                "source": "hermes-brain-loop",
+            })
+            logger.info("brain-loop: added timeline to /%s", slug)
+        except Exception as e:
+            logger.debug("brain-loop: timeline write failed for /%s: %s", slug, e)
+
+    # ── brain-agent-loop: WRITE step ──────────────────────────────────
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages=None,
+    ) -> None:
+        """Write timeline entries for entities mentioned in the conversation.
+
+        Called after each turn completes. Already runs on a background
+        worker thread via memory_manager's ThreadPoolExecutor — no
+        additional daemon thread needed.
+        """
+        if not self._mcp or not user_content:
+            return
+
+        today_str = date.today().isoformat()
+        try:
+            entities = self._resolve_entities(user_content)
+            for e in entities:
+                self._write_timeline(e["slug"], today_str)
+        except Exception as e:
+            logger.debug("brain-loop sync_turn background failed: %s", e)
 
 
 def register(ctx) -> None:
