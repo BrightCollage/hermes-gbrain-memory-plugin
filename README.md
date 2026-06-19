@@ -55,16 +55,7 @@ The plugin reads configuration from environment variables:
 
 When `MCP_GBRAIN_OAUTH_CLIENT_ID` and `MCP_GBRAIN_OAUTH_CLIENT_SECRET` are both set, the plugin uses the `client_credentials` grant to obtain a bearer token automatically, refreshing it before expiry. The token endpoint is always `<MCP_GBRAIN_URL_base>/token` (derived from the MCP URL by replacing `/mcp` with `/token`). The static `MCP_GBRAIN_API_KEY` is ignored in this mode.
 
-Config file fallback (for non-secret values only) at `$HERMES_HOME/gbrain_memory.json`:
-
-```json
-{
-  "url": "https://gbrain.plainrandom.com/mcp",
-  "timeout": 30
-}
-```
-
-Run `hermes memory setup` for an interactive configuration wizard.
+All config is env-var based. Run `hermes memory setup` for an interactive wizard that writes your choices to `.env`.
 
 ## Activation
 

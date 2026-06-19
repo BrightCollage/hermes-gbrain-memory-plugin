@@ -9,8 +9,8 @@ and stored in _schemas.py. Regenerate with:
 
 Supports two auth modes:
 
-  **Static bearer token** (legacy) — uses MCP_GBRAIN_API_KEY or
-  GBRAIN_API_TOKEN as a pre-minted bearer token for the /mcp endpoint.
+  **Static bearer token** (legacy) — uses MCP_GBRAIN_API_KEY as a
+  pre-minted bearer token for the /mcp endpoint.
 
   **OAuth client_credentials** — exchanges a client_id + client_secret
   for a bearer token at the /token endpoint, with automatic refresh
@@ -18,9 +18,7 @@ Supports two auth modes:
   MCP_GBRAIN_OAUTH_CLIENT_SECRET are set. Falls back to static token
   if neither OAuth pair is configured.
 
-Config source (priority):
-  1. Env vars (see _load_config for the full precedence chain)
-  2. $HERMES_HOME/gbrain_memory.json
+All configuration is env-var based (MCP_GBRAIN_* prefix). No config file.
 """
 
 from __future__ import annotations
@@ -38,7 +36,6 @@ from typing import Any
 import httpx
 
 from agent.memory_provider import MemoryProvider
-from hermes_constants import get_hermes_home
 
 from ._schemas import HARDCODED_SCHEMAS, HARDCODED_SCHEMA_DICTS
 from ._stop_words import _STOP_WORDS
@@ -279,29 +276,14 @@ class _McpClient:
 
 
 def _load_config() -> dict:
-    hermes_home = get_hermes_home()
-    config_path = Path(hermes_home) / "gbrain_memory.json"
-    config = {}
-    if config_path.exists():
-        try:
-            config = json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to read %s: %s", config_path, e)
-    config["url"] = (
-        os.environ.get("MCP_GBRAIN_URL")
-        or config.get("url", _DEFAULT_URL)
-    )
-    config["api_token"] = (
-        os.environ.get("MCP_GBRAIN_API_KEY")
-        or config.get("api_token", "")
-    )
-    # OAuth client_credentials — env only, MCP_GBRAIN_ prefix only
-    config["oauth_client_id"] = os.environ.get("MCP_GBRAIN_OAUTH_CLIENT_ID", "")
-    config["oauth_client_secret"] = os.environ.get("MCP_GBRAIN_OAUTH_CLIENT_SECRET", "")
-    config["timeout"] = float(
-        os.environ.get("MCP_GBRAIN_TIMEOUT") or config.get("timeout", _DEFAULT_TIMEOUT)
-    )
-    return config
+    """Read configuration from environment variables only — no JSON fallback."""
+    return {
+        "url": os.environ.get("MCP_GBRAIN_URL", _DEFAULT_URL),
+        "api_token": os.environ.get("MCP_GBRAIN_API_KEY", ""),
+        "oauth_client_id": os.environ.get("MCP_GBRAIN_OAUTH_CLIENT_ID", ""),
+        "oauth_client_secret": os.environ.get("MCP_GBRAIN_OAUTH_CLIENT_SECRET", ""),
+        "timeout": float(os.environ.get("MCP_GBRAIN_TIMEOUT", _DEFAULT_TIMEOUT)),
+    }
 
 
 class GBrainMemoryProvider(MemoryProvider):
@@ -498,11 +480,19 @@ class GBrainMemoryProvider(MemoryProvider):
 
         def _set_env(key: str, value: str) -> None:
             nonlocal env_lines
-            # Remove existing entry for this key
             env_lines = [l for l in env_lines if not l.startswith(f"{key}=")]
             env_lines.append(f"{key}={value}")
 
-        # Strip old OAuth vars so a switch from OAuth→API doesn't leave stale secrets
+        # Persist url and timeout from schema prompts
+        url = config.get("url") or os.environ.get("MCP_GBRAIN_URL", _DEFAULT_URL)
+        timeout = str(
+            config.get("timeout")
+            or os.environ.get("MCP_GBRAIN_TIMEOUT", str(_DEFAULT_TIMEOUT))
+        )
+        _set_env("MCP_GBRAIN_URL", url)
+        _set_env("MCP_GBRAIN_TIMEOUT", timeout)
+
+        # Strip old auth vars so a switch doesn't leave stale secrets
         for stale_key in (
             "MCP_GBRAIN_API_KEY",
             "MCP_GBRAIN_OAUTH_CLIENT_ID",
@@ -511,7 +501,6 @@ class GBrainMemoryProvider(MemoryProvider):
             env_lines = [l for l in env_lines if not l.startswith(f"{stale_key}=")]
 
         if choice == "2":
-            # OAuth mode
             print("\n── OAuth Client Credentials ──")
             cid = input("Client ID: ").strip()
             secret = input("Client secret: ").strip()
@@ -522,7 +511,6 @@ class GBrainMemoryProvider(MemoryProvider):
             else:
                 print("  ✗ Both client ID and secret are required — skipping")
         else:
-            # API key mode (default)
             print("\n── API Key ──")
             token = input("Bearer token: ").strip()
             if token:
@@ -532,21 +520,10 @@ class GBrainMemoryProvider(MemoryProvider):
                 print("  ✗ Token is required — skipping")
 
         env_path.write_text("\n".join(env_lines) + "\n")
-
-        # Return updated config so save_config() can persist non-secrets
         return config
 
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
-        path = Path(hermes_home) / "gbrain_memory.json"
-        existing = {}
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
-        existing["url"] = values.get("url", existing.get("url", _DEFAULT_URL))
-        existing["timeout"] = int(values.get("timeout", existing.get("timeout", _DEFAULT_TIMEOUT)))
-        path.write_text(json.dumps(existing, indent=2) + "\n")
+        """No-op — all config is env-based, persisted by post_setup()."""
 
     def is_available(self) -> bool:
         """Check config only — NO network calls (per MemoryProvider contract)."""
