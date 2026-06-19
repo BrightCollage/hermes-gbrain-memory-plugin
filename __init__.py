@@ -168,17 +168,14 @@ def _load_config() -> dict:
             logger.warning("Failed to read %s: %s", config_path, e)
     config["url"] = (
         os.environ.get("MCP_GBRAIN_URL")
-        or os.environ.get("GBRAIN_MCP_URL")
         or config.get("url", _DEFAULT_URL)
     )
     config["api_token"] = (
         os.environ.get("MCP_GBRAIN_API_KEY")
-        or os.environ.get("GBRAIN_API_TOKEN")
-        or os.environ.get("GBRAIN_MCP_TOKEN")
         or config.get("api_token", "")
     )
     config["timeout"] = float(
-        os.environ.get("GBRAIN_MCP_TIMEOUT") or config.get("timeout", _DEFAULT_TIMEOUT)
+        os.environ.get("MCP_GBRAIN_TIMEOUT") or config.get("timeout", _DEFAULT_TIMEOUT)
     )
     return config
 

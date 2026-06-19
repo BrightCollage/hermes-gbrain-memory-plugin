@@ -5,7 +5,5 @@ requires_env:
   - MCP_GBRAIN_API_KEY
 optional_env:
   - MCP_GBRAIN_URL
-  - GBRAIN_MCP_URL
-  - GBRAIN_API_TOKEN
-  - GBRAIN_MCP_TIMEOUT
+  - MCP_GBRAIN_TIMEOUT
 hooks: []
