@@ -469,6 +469,7 @@ class GBrainMemoryProvider(MemoryProvider):
         return "gbrain"
 
     def get_config_schema(self) -> list[dict[str, Any]]:
+        """Shared config fields — auth credentials are handled in post_setup()."""
         return [
             {
                 "key": "url",
@@ -476,34 +477,64 @@ class GBrainMemoryProvider(MemoryProvider):
                 "default": _DEFAULT_URL,
             },
             {
-                "key": "api_token",
-                "description": "GBrain MCP API bearer token (ignored if OAuth client_id + secret are set)",
-                "secret": True,
-                "env_var": "MCP_GBRAIN_API_KEY",
-                "required": False,
-            },
-            {
-                "key": "oauth_client_id",
-                "description": "GBrain OAuth client ID (client_credentials grant). "
-                "When set (together with oauth_client_secret), OAuth takes "
-                "precedence over the static api_token.",
-                "secret": True,
-                "env_var": "MCP_GBRAIN_OAUTH_CLIENT_ID",
-                "required": False,
-            },
-            {
-                "key": "oauth_client_secret",
-                "description": "GBrain OAuth client secret",
-                "secret": True,
-                "env_var": "MCP_GBRAIN_OAUTH_CLIENT_SECRET",
-                "required": False,
-            },
-            {
                 "key": "timeout",
                 "description": "Request timeout in seconds",
                 "default": _DEFAULT_TIMEOUT,
             },
         ]
+
+    def post_setup(self, hermes_home: str, config: dict[str, Any]) -> dict[str, Any]:
+        """Interactive setup wizard: choose API key or OAuth, then prompt for credentials."""
+        print("\n── GBrain Auth Setup ──")
+        print("Choose an authentication method:")
+        print("  1) API key (static bearer token)")
+        print("  2) OAuth client_credentials")
+        choice = input("Choice [1/2]: ").strip()
+
+        env_path = Path(hermes_home) / ".env"
+        env_lines: list[str] = []
+        if env_path.exists():
+            env_lines = env_path.read_text().splitlines()
+
+        def _set_env(key: str, value: str) -> None:
+            nonlocal env_lines
+            # Remove existing entry for this key
+            env_lines = [l for l in env_lines if not l.startswith(f"{key}=")]
+            env_lines.append(f"{key}={value}")
+
+        # Strip old OAuth vars so a switch from OAuth→API doesn't leave stale secrets
+        for stale_key in (
+            "MCP_GBRAIN_API_KEY",
+            "MCP_GBRAIN_OAUTH_CLIENT_ID",
+            "MCP_GBRAIN_OAUTH_CLIENT_SECRET",
+        ):
+            env_lines = [l for l in env_lines if not l.startswith(f"{stale_key}=")]
+
+        if choice == "2":
+            # OAuth mode
+            print("\n── OAuth Client Credentials ──")
+            cid = input("Client ID: ").strip()
+            secret = input("Client secret: ").strip()
+            if cid and secret:
+                _set_env("MCP_GBRAIN_OAUTH_CLIENT_ID", cid)
+                _set_env("MCP_GBRAIN_OAUTH_CLIENT_SECRET", secret)
+                print("  ✓ OAuth credentials saved")
+            else:
+                print("  ✗ Both client ID and secret are required — skipping")
+        else:
+            # API key mode (default)
+            print("\n── API Key ──")
+            token = input("Bearer token: ").strip()
+            if token:
+                _set_env("MCP_GBRAIN_API_KEY", token)
+                print("  ✓ API key saved")
+            else:
+                print("  ✗ Token is required — skipping")
+
+        env_path.write_text("\n".join(env_lines) + "\n")
+
+        # Return updated config so save_config() can persist non-secrets
+        return config
 
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
         path = Path(hermes_home) / "gbrain_memory.json"
