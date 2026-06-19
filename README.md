@@ -38,19 +38,28 @@ cp -r hermes-gbrain-memory-plugin/gbrain ~/.hermes/plugins/
 
 ## Configuration
 
-The plugin reads configuration from environment variables (highest priority first):
+The plugin reads configuration from environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MCP_GBRAIN_API_KEY` | GBrain MCP API bearer token | **(required)** |
+| `MCP_GBRAIN_API_KEY` | GBrain MCP API bearer token (static auth) | — |
 | `MCP_GBRAIN_URL` | GBrain MCP endpoint URL | `https://gbrain.plainrandom.com/mcp` |
+| `MCP_GBRAIN_TIMEOUT` | Request timeout in seconds | 30 |
 
-Config file fallback at `$HERMES_HOME/gbrain_memory.json`:
+**OAuth client_credentials** (takes precedence when both client_id + secret are set):
+
+| Variable | Description |
+|----------|-------------|
+| `MCP_GBRAIN_OAUTH_CLIENT_ID` | OAuth client ID |
+| `MCP_GBRAIN_OAUTH_CLIENT_SECRET` | OAuth client secret |
+
+When `MCP_GBRAIN_OAUTH_CLIENT_ID` and `MCP_GBRAIN_OAUTH_CLIENT_SECRET` are both set, the plugin uses the `client_credentials` grant to obtain a bearer token automatically, refreshing it before expiry. The token endpoint is always `<MCP_GBRAIN_URL_base>/token` (derived from the MCP URL by replacing `/mcp` with `/token`). The static `MCP_GBRAIN_API_KEY` is ignored in this mode.
+
+Config file fallback (for non-secret values only) at `$HERMES_HOME/gbrain_memory.json`:
 
 ```json
 {
   "url": "https://gbrain.plainrandom.com/mcp",
-  "api_token": "gbrain_...",
   "timeout": 30
 }
 ```

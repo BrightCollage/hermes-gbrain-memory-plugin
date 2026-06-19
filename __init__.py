@@ -1,4 +1,4 @@
-"""GBrain memory provider plugin — hardcoded tool schemas.
+"""GBrain memory provider plugin — hardcoded tool schemas + OAuth support.
 
 Connects to GBrain via MCP-over-HTTP (StreamableHTTP) and exposes
 83 hardcoded tool schemas through the MemoryProvider interface.
@@ -7,10 +7,20 @@ and stored in _schemas.py. Regenerate with:
 
     python3 -c "from _schemas import *; ..."
 
+Supports two auth modes:
+
+  **Static bearer token** (legacy) — uses MCP_GBRAIN_API_KEY or
+  GBRAIN_API_TOKEN as a pre-minted bearer token for the /mcp endpoint.
+
+  **OAuth client_credentials** — exchanges a client_id + client_secret
+  for a bearer token at the /token endpoint, with automatic refresh
+  on expiry. Enabled when BOTH MCP_GBRAIN_OAUTH_CLIENT_ID and
+  MCP_GBRAIN_OAUTH_CLIENT_SECRET are set. Falls back to static token
+  if neither OAuth pair is configured.
+
 Config source (priority):
-  1. Env vars: MCP_GBRAIN_URL, MCP_GBRAIN_API_KEY
-  2. Env vars: GBRAIN_MCP_URL, GBRAIN_API_TOKEN, GBRAIN_MCP_TOKEN
-  3. $HERMES_HOME/gbrain_memory.json
+  1. Env vars (see _load_config for the full precedence chain)
+  2. $HERMES_HOME/gbrain_memory.json
 """
 
 from __future__ import annotations
@@ -20,6 +30,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -36,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_URL = "https://gbrain.plainrandom.com/mcp"
 _DEFAULT_TIMEOUT = 30
+_DEFAULT_OAUTH_TOKEN_TTL = 3600  # 1 hour fallback if server omits expires_in
 
 
 class _McpError(RuntimeError):
@@ -43,12 +55,37 @@ class _McpError(RuntimeError):
 
 
 class _McpClient:
-    """Thread-safe MCP-over-HTTP client. Connects on-demand, no tool discovery."""
+    """Thread-safe MCP-over-HTTP client. Connects on-demand, no tool discovery.
 
-    def __init__(self, url: str, api_token: str, timeout: float = _DEFAULT_TIMEOUT):
+    Supports two auth modes:
+
+    * **Static bearer token** — pass ``api_token``. Used as-is for the
+      ``Authorization`` header.
+
+    * **OAuth client_credentials** — pass ``oauth_client_id`` +
+      ``oauth_client_secret`` (both non-empty). The client fetches a fresh
+      bearer token from ``oauth_token_url`` (defaults to ``<base>/token``)
+      before each MCP call, with proactive refresh before expiry.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        api_token: str = "",
+        timeout: float = _DEFAULT_TIMEOUT,
+        *,
+        oauth_client_id: str = "",
+        oauth_client_secret: str = "",
+    ):
         self._base_url = url.rstrip("/")
         self._api_token = api_token
         self._timeout = timeout
+        self._oauth_client_id = oauth_client_id
+        self._oauth_client_secret = oauth_client_secret
+        # OAuth token endpoint is always <mcp_base>/token
+        self._oauth_token_url = self._base_url.replace("/mcp", "").rstrip("/") + "/token"
+        self._is_oauth = bool(oauth_client_id and oauth_client_secret)
+        self._token_expires_at: float = 0.0
         self._session_id: str | None = None
         self._lock = threading.RLock()
         self._closed = False
@@ -58,6 +95,7 @@ class _McpClient:
         if self._closed:
             raise _McpError("Client is closed")
         with self._lock:
+            self._ensure_token()
             self._ensure_session()
             body = {
                 "jsonrpc": "2.0",
@@ -70,16 +108,51 @@ class _McpClient:
             resp = httpx.post(self._base_url, json=body, headers=headers, timeout=self._timeout)
             resp.raise_for_status()
             result = self._parse_sse(resp.text)
-        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as exc:
+        except httpx.HTTPStatusError as exc:
+            # 401 in OAuth mode → force token refresh and retry once
+            if self._is_oauth and exc.response.status_code == 401:
+                logger.debug("GBrain OAuth: token expired (401), refreshing and retrying")
+                with self._lock:
+                    self._force_token_refresh()
+                    self._ensure_token()
+                    body["id"] = self._next_id()
+                    headers = self._auth_headers()
+                try:
+                    retry_resp = httpx.post(
+                        self._base_url, json=body, headers=headers, timeout=self._timeout
+                    )
+                    retry_resp.raise_for_status()
+                    result = self._parse_sse(retry_resp.text)
+                except httpx.HTTPStatusError as retry_exc:
+                    raise _McpError(
+                        f"OAuth token refresh did not resolve auth: "
+                        f"{retry_exc.response.status_code} {retry_exc.response.text[:500]}"
+                    ) from retry_exc
+                except (httpx.TimeoutException, httpx.ConnectError) as retry_exc:
+                    raise _McpError(
+                        f"MCP call failed after OAuth token refresh: {retry_exc}"
+                    ) from retry_exc
+            else:
+                raise _McpError(
+                    f"MCP returned {exc.response.status_code}: {exc.response.text[:500]}"
+                ) from exc
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
             logger.debug("MCP call failed, reconnecting: %s", exc)
             with self._lock:
                 self._session_id = None
                 self._ensure_session()
                 body["id"] = self._next_id()
                 headers = self._auth_headers()
-            retry_resp = httpx.post(self._base_url, json=body, headers=headers, timeout=self._timeout)
-            retry_resp.raise_for_status()
-            result = self._parse_sse(retry_resp.text)
+            try:
+                retry_resp = httpx.post(
+                    self._base_url, json=body, headers=headers, timeout=self._timeout
+                )
+                retry_resp.raise_for_status()
+                result = self._parse_sse(retry_resp.text)
+            except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as retry_exc:
+                raise _McpError(
+                    f"MCP call failed after reconnect: {retry_exc}"
+                ) from retry_exc
         error = result.get("error")
         if error:
             raise _McpError(error.get("message", str(error)))
@@ -106,6 +179,54 @@ class _McpClient:
     def _next_id(self) -> int:
         self._req_id += 1
         return self._req_id
+
+    def _ensure_token(self) -> None:
+        """Obtain or refresh the OAuth bearer token.
+
+        No-op in static-token mode. In OAuth mode, fetches a fresh token
+        from the /token endpoint when:
+
+        * No token has been acquired yet (first call).
+        * The current token is within 60 seconds of expiry.
+        * The server returned 401 on the previous call (forced refresh).
+        """
+        if not self._is_oauth:
+            return
+        now = time.monotonic()
+        if self._api_token and now < self._token_expires_at - 60:
+            return
+        logger.debug("GBrain OAuth: acquiring fresh token from %s", self._oauth_token_url)
+        try:
+            resp = httpx.post(
+                self._oauth_token_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self._oauth_client_id,
+                    "client_secret": self._oauth_client_secret,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            token = data.get("access_token")
+            if not token:
+                raise _McpError(
+                    "OAuth token response missing 'access_token' field"
+                )
+            self._api_token = token
+            expires_in = data.get("expires_in", _DEFAULT_OAUTH_TOKEN_TTL)
+            self._token_expires_at = time.monotonic() + int(expires_in)
+            logger.debug("GBrain OAuth: token acquired, expires in %ss", expires_in)
+        except _McpError:
+            raise
+        except Exception as e:
+            raise _McpError(f"OAuth token acquisition failed: {e}") from e
+
+    def _force_token_refresh(self) -> None:
+        """Clear the current token so the next _ensure_token fetches fresh."""
+        self._api_token = ""
+        self._token_expires_at = 0.0
 
     @staticmethod
     def _parse_sse(text: str) -> dict:
@@ -168,17 +289,17 @@ def _load_config() -> dict:
             logger.warning("Failed to read %s: %s", config_path, e)
     config["url"] = (
         os.environ.get("MCP_GBRAIN_URL")
-        or os.environ.get("GBRAIN_MCP_URL")
         or config.get("url", _DEFAULT_URL)
     )
     config["api_token"] = (
         os.environ.get("MCP_GBRAIN_API_KEY")
-        or os.environ.get("GBRAIN_API_TOKEN")
-        or os.environ.get("GBRAIN_MCP_TOKEN")
         or config.get("api_token", "")
     )
+    # OAuth client_credentials — env only, MCP_GBRAIN_ prefix only
+    config["oauth_client_id"] = os.environ.get("MCP_GBRAIN_OAUTH_CLIENT_ID", "")
+    config["oauth_client_secret"] = os.environ.get("MCP_GBRAIN_OAUTH_CLIENT_SECRET", "")
     config["timeout"] = float(
-        os.environ.get("GBRAIN_MCP_TIMEOUT") or config.get("timeout", _DEFAULT_TIMEOUT)
+        os.environ.get("MCP_GBRAIN_TIMEOUT") or config.get("timeout", _DEFAULT_TIMEOUT)
     )
     return config
 
@@ -356,10 +477,26 @@ class GBrainMemoryProvider(MemoryProvider):
             },
             {
                 "key": "api_token",
-                "description": "GBrain MCP API bearer token",
+                "description": "GBrain MCP API bearer token (ignored if OAuth client_id + secret are set)",
                 "secret": True,
                 "env_var": "MCP_GBRAIN_API_KEY",
-                "required": True,
+                "required": False,
+            },
+            {
+                "key": "oauth_client_id",
+                "description": "GBrain OAuth client ID (client_credentials grant). "
+                "When set (together with oauth_client_secret), OAuth takes "
+                "precedence over the static api_token.",
+                "secret": True,
+                "env_var": "MCP_GBRAIN_OAUTH_CLIENT_ID",
+                "required": False,
+            },
+            {
+                "key": "oauth_client_secret",
+                "description": "GBrain OAuth client secret",
+                "secret": True,
+                "env_var": "MCP_GBRAIN_OAUTH_CLIENT_SECRET",
+                "required": False,
             },
             {
                 "key": "timeout",
@@ -383,18 +520,34 @@ class GBrainMemoryProvider(MemoryProvider):
     def is_available(self) -> bool:
         """Check config only — NO network calls (per MemoryProvider contract)."""
         cfg = _load_config()
-        return bool(cfg.get("api_token"))
+        has_token = bool(cfg.get("api_token"))
+        has_oauth = bool(cfg.get("oauth_client_id") and cfg.get("oauth_client_secret"))
+        return has_token or has_oauth
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
         url = self._config["url"]
         token = self._config["api_token"]
         timeout = self._config["timeout"]
-        if not token:
-            logger.warning("GBrain not configured: missing api_token")
+        has_any_auth = bool(
+            token
+            or (self._config["oauth_client_id"] and self._config["oauth_client_secret"])
+        )
+        if not has_any_auth:
+            logger.warning("GBrain not configured: missing api_token or OAuth credentials")
             return
-        self._mcp = _McpClient(url, token, timeout)
-        logger.info("GBrain initialized — %d hardcoded tool schemas", len(HARDCODED_SCHEMA_DICTS))
+        self._mcp = _McpClient(
+            url,
+            api_token=token,
+            timeout=timeout,
+            oauth_client_id=self._config["oauth_client_id"],
+            oauth_client_secret=self._config["oauth_client_secret"],
+        )
+        logger.info(
+            "GBrain initialized — %s — %d hardcoded tool schemas",
+            "OAuth client_credentials" if self._config["oauth_client_id"] else "static bearer token",
+            len(HARDCODED_SCHEMA_DICTS),
+        )
 
     def shutdown(self) -> None:
         if self._mcp:
