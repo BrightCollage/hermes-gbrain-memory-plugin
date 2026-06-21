@@ -61,3 +61,21 @@ Returning the last valid message handles both cases — it's the final result.
 **Decision:** `gbrain_delete` previews the page on first call, requires `confirm=true` to execute.
 
 **Rationale:** Prevent accidental data loss. The preview shows page content before deletion.
+
+## 9. OAuth Client Credentials Auth
+
+**Decision:** Support OAuth 2.1 `client_credentials` grant alongside the legacy static bearer token. OAuth mode is activated when both `MCP_GBRAIN_OAUTH_CLIENT_ID` and `MCP_GBRAIN_OAUTH_CLIENT_SECRET` env vars are set.
+
+**Config precedence:**
+- OAuth fields are **env-only** — no JSON file fallback (avoids leaking secrets into filesystem)
+- Static token (`MCP_GBRAIN_API_KEY`) is the fallback when OAuth isn't configured
+- When both are present, OAuth takes precedence
+
+**Token lifecycle in `_McpClient`:**
+1. Before every MCP `call()`, `_ensure_token()` checks if a fresh OAuth token is needed
+2. Token is acquired via `POST /token` with form-encoded `grant_type=client_credentials` + `client_id` + `client_secret`
+3. Proactive refresh when token is within 60s of expiry
+4. On 401 from MCP, a forced refresh + retry is attempted once before reporting failure
+5. MCP session reconnect (existing behavior) is independent of token refresh
+
+**Rationale:** Allows Hermes to authenticate to GBrain via OAuth without needing a pre-minted static bearer token. The client_credentials flow is the standard MCP OAuth pattern — Hermes gets a time-limited bearer token from the `/token` endpoint using its registered client credentials, and automatically refreshes it.
